@@ -2,8 +2,9 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    GITHUB_TOKEN: str
-    GITHUB_REPO: str
+    ALLOWED_GITHUB_TOKEN: str
+    # 수집 대상 GitHub Organization
+    GITHUB_ORG: str = "SG-STAgora"
     DATABASE_URL: str
 
     class Config:

@@ -25,5 +25,18 @@ services:
     ports:
       - "8000:8000"
 
+  metabase:
+    image: metabase/metabase:latest
+    restart: unless-stopped
+    depends_on:
+      - db
+    ports:
+      - "3000:3000"
+    environment:
+      JAVA_TIMEZONE: Asia/Seoul
+    volumes:
+      - metabase_data:/metabase-data
+
 volumes:
   postgres_data:
+  metabase_data:

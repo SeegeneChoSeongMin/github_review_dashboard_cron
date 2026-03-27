@@ -18,6 +18,6 @@ def get_db():
 
 
 def init_db():
-    from models import RepoMetrics  # noqa: F401
+    from models import Developer, DeveloperMergedPRLines, DeveloperPRActivity, DeveloperPREvent, DeveloperReviewEvent, DeveloperTeam, DeveloperWeeklyCommits  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
