@@ -623,7 +623,12 @@ def backfill_weekly_commits() -> dict:
     try:
         now = datetime.now(timezone.utc)
         for repo in repos:
-            stats = fetch_contributor_stats(repo)
+            try:
+                stats = fetch_contributor_stats(repo)
+            except Exception as exc:
+                logger.error("backfill_weekly_commits: fetch failed for %s: %s", repo, exc)
+                skipped.append(repo)
+                continue
             if not stats:
                 logger.warning("backfill_weekly_commits: no stats for %s — skipped", repo)
                 skipped.append(repo)

@@ -61,7 +61,12 @@ def fetch_contributor_stats(repo: str) -> list[dict]:
             time.sleep(5 * (attempt + 1))
             continue
         response.raise_for_status()
-        return response.json() or []
+        if not response.content:
+            return []
+        try:
+            return response.json() or []
+        except Exception:
+            return []
     logger.warning("Contributor stats unavailable for %s after retries", repo)
     return []
 
