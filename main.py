@@ -10,7 +10,7 @@ from config import settings
 from database import get_db, init_db
 from github_client import fetch_org_team_members, fetch_user_names
 from models import Developer, DeveloperMergedPRLines, DeveloperPRActivity, DeveloperTeam, DeveloperWeeklyCommits
-from scheduler import backfill_pr_data, collect_metrics, start_scheduler, stop_scheduler
+from scheduler import backfill_pr_data, backfill_weekly_commits, collect_metrics, start_scheduler, stop_scheduler
 from schemas import (
     DeveloperCreate,
     DeveloperMergedPRLinesResponse,
@@ -161,6 +161,17 @@ def trigger_backfill(
 
     background_tasks.add_task(backfill_pr_data, since_dt)
     return {"status": "backfill started", "since": since_dt.isoformat()}
+
+
+@app.post("/backfill-weekly-commits", status_code=202)
+def trigger_backfill_weekly_commits(background_tasks: BackgroundTasks):
+    """
+    developer_weekly_commits 전체 히스토리 백필.
+    GitHub /stats/contributors API로 org 내 모든 repo의 주간 커밋/라인 데이터를 upsert합니다.
+    처리 시간이 길기 때문에 백그라운드로 실행되며, 진행 상황은 서버 로그에서 확인하세요.
+    """
+    background_tasks.add_task(backfill_weekly_commits)
+    return {"status": "backfill started"}
 
 
 @app.get("/health")

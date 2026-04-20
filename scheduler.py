@@ -605,6 +605,79 @@ def backfill_pr_data(since: datetime) -> dict:
     return summary
 
 
+def backfill_weekly_commits() -> dict:
+    """
+    /stats/contributors API로 전체 주간 히스토리를 모든 org repo에 대해 upsert.
+    GitHub stats API는 전체 히스토리를 반환하므로 since 파라미터 불필요.
+    엔드포인트에서 백그라운드 스레드로 호출.
+    """
+    try:
+        repos = fetch_org_repos(settings.GITHUB_ORG)
+    except Exception as exc:
+        logger.error("backfill_weekly_commits: failed to fetch repos: %s", exc)
+        return {"error": str(exc)}
+
+    total_upserted = 0
+    skipped = []
+    db = SessionLocal()
+    try:
+        now = datetime.now(timezone.utc)
+        for repo in repos:
+            stats = fetch_contributor_stats(repo)
+            if not stats:
+                logger.warning("backfill_weekly_commits: no stats for %s — skipped", repo)
+                skipped.append(repo)
+                continue
+
+            upserted = 0
+            for contributor in stats:
+                login: str = (contributor.get("author") or {}).get("login", "")
+                if not login:
+                    continue
+                for week in contributor.get("weeks", []):
+                    additions = week.get("a", 0)
+                    deletions = week.get("d", 0)
+                    commits = week.get("c", 0)
+                    if additions == 0 and deletions == 0 and commits == 0:
+                        continue
+                    week_start = date.fromtimestamp(week["w"])
+                    existing = (
+                        db.query(DeveloperWeeklyCommits)
+                        .filter(
+                            DeveloperWeeklyCommits.repo == repo,
+                            DeveloperWeeklyCommits.github_login == login,
+                            DeveloperWeeklyCommits.week_start == week_start,
+                        )
+                        .first()
+                    )
+                    if existing:
+                        existing.additions = additions
+                        existing.deletions = deletions
+                        existing.commits = commits
+                        existing.collected_at = now
+                    else:
+                        db.add(
+                            DeveloperWeeklyCommits(
+                                repo=repo,
+                                github_login=login,
+                                week_start=week_start,
+                                additions=additions,
+                                deletions=deletions,
+                                commits=commits,
+                                collected_at=now,
+                            )
+                        )
+                    upserted += 1
+            db.commit()
+            logger.info("backfill_weekly_commits: %s → %d rows", repo, upserted)
+            total_upserted += upserted
+    finally:
+        db.close()
+
+    logger.info("backfill_weekly_commits done: %d total rows, %d repos skipped", total_upserted, len(skipped))
+    return {"total_upserted": total_upserted, "skipped_repos": skipped}
+
+
 def start_scheduler() -> None:
     # 기동 직후 즉시 1회 실행
     scheduler.add_job(collect_metrics, "date", id="collect_metrics_startup")
