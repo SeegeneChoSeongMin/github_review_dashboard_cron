@@ -207,6 +207,27 @@ def fetch_org_team_members(org: str) -> dict[str, list[str]]:
     return team_map
 
 
+def fetch_user_names(logins: list[str]) -> dict[str, str | None]:
+    """
+    GET /users/{login} 을 각 login에 대해 호출하여 프로필 표시 이름(name)을 반환.
+    name이 없는 경우 None.
+    """
+    result: dict[str, str | None] = {}
+    with httpx.Client(timeout=30) as client:
+        for login in logins:
+            response = client.get(
+                f"https://api.github.com/users/{login}",
+                headers=_headers(),
+            )
+            if response.status_code == 404:
+                result[login] = None
+                continue
+            response.raise_for_status()
+            result[login] = response.json().get("name")  # 프로필 표시 이름, 미설정 시 None
+    logger.info("Fetched profile names for %d users", len(result))
+    return result
+
+
 def fetch_merged_pull_requests(repo: str, since: datetime) -> list[dict]:
     """
     GET /repos/{repo}/pulls?state=closed&sort=updated&direction=desc

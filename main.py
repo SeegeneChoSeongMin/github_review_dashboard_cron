@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from config import settings
 from database import get_db, init_db
-from github_client import fetch_org_team_members
+from github_client import fetch_org_team_members, fetch_user_names
 from models import Developer, DeveloperMergedPRLines, DeveloperPRActivity, DeveloperTeam, DeveloperWeeklyCommits
 from scheduler import backfill_pr_data, collect_metrics, start_scheduler, stop_scheduler
 from schemas import (
@@ -180,6 +180,10 @@ def sync_teams(db: Session = Depends(get_db)):
     """
     team_map = fetch_org_team_members(settings.GITHUB_ORG)
 
+    # 전체 unique login 목록으로 GitHub 프로필 이름 일괄 수집
+    all_logins = list({login for logins in team_map.values() for login in logins})
+    user_names = fetch_user_names(all_logins)
+
     dev_created = 0
     team_rows_upserted = 0
 
@@ -187,9 +191,14 @@ def sync_teams(db: Session = Depends(get_db)):
         for login in logins:
             # developers 테이블에 없으면 생성
             if not db.query(Developer).filter(Developer.github_login == login).first():
-                db.add(Developer(github_login=login))
+                db.add(Developer(github_login=login, name=user_names.get(login)))
                 db.flush()  # id 확보
                 dev_created += 1
+            else:
+                # 기존 개발자도 name이 비어있으면 업데이트
+                dev = db.query(Developer).filter(Developer.github_login == login).first()
+                if dev.name is None and user_names.get(login):
+                    dev.name = user_names[login]
 
             # developer_teams upsert (이미 있으면 skip)
             exists = (
