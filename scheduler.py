@@ -635,47 +635,52 @@ def backfill_weekly_commits() -> dict:
                 continue
 
             upserted = 0
-            for contributor in stats:
-                login: str = (contributor.get("author") or {}).get("login", "")
-                if not login:
-                    continue
-                for week in contributor.get("weeks", []):
-                    additions = week.get("a", 0)
-                    deletions = week.get("d", 0)
-                    commits = week.get("c", 0)
-                    if additions == 0 and deletions == 0 and commits == 0:
+            try:
+                for contributor in stats:
+                    login: str = (contributor.get("author") or {}).get("login", "")
+                    if not login:
                         continue
-                    week_start = date.fromtimestamp(week["w"])
-                    existing = (
-                        db.query(DeveloperWeeklyCommits)
-                        .filter(
-                            DeveloperWeeklyCommits.repo == repo,
-                            DeveloperWeeklyCommits.github_login == login,
-                            DeveloperWeeklyCommits.week_start == week_start,
-                        )
-                        .first()
-                    )
-                    if existing:
-                        existing.additions = additions
-                        existing.deletions = deletions
-                        existing.commits = commits
-                        existing.collected_at = now
-                    else:
-                        db.add(
-                            DeveloperWeeklyCommits(
-                                repo=repo,
-                                github_login=login,
-                                week_start=week_start,
-                                additions=additions,
-                                deletions=deletions,
-                                commits=commits,
-                                collected_at=now,
+                    for week in contributor.get("weeks", []):
+                        additions = week.get("a", 0)
+                        deletions = week.get("d", 0)
+                        commits = week.get("c", 0)
+                        if additions == 0 and deletions == 0 and commits == 0:
+                            continue
+                        week_start = date.fromtimestamp(week["w"])
+                        existing = (
+                            db.query(DeveloperWeeklyCommits)
+                            .filter(
+                                DeveloperWeeklyCommits.repo == repo,
+                                DeveloperWeeklyCommits.github_login == login,
+                                DeveloperWeeklyCommits.week_start == week_start,
                             )
+                            .first()
                         )
-                    upserted += 1
-            db.commit()
-            logger.info("backfill_weekly_commits: %s → %d rows", repo, upserted)
-            total_upserted += upserted
+                        if existing:
+                            existing.additions = additions
+                            existing.deletions = deletions
+                            existing.commits = commits
+                            existing.collected_at = now
+                        else:
+                            db.add(
+                                DeveloperWeeklyCommits(
+                                    repo=repo,
+                                    github_login=login,
+                                    week_start=week_start,
+                                    additions=additions,
+                                    deletions=deletions,
+                                    commits=commits,
+                                    collected_at=now,
+                                )
+                            )
+                        upserted += 1
+                db.commit()
+                logger.info("backfill_weekly_commits: %s → %d rows", repo, upserted)
+                total_upserted += upserted
+            except Exception as exc:
+                logger.error("backfill_weekly_commits: upsert failed for %s: %s", repo, exc)
+                db.rollback()
+                skipped.append(repo)
     finally:
         db.close()
 
