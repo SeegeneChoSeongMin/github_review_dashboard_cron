@@ -14,6 +14,7 @@ from github_client import (
     CONTRIBUTOR_STATS_ERROR,
     CONTRIBUTOR_STATS_PENDING,
     CONTRIBUTOR_STATS_READY,
+    fetch_commit_detail,
     fetch_contributor_stats,
     fetch_contributor_stats_with_status,
     fetch_merged_pull_requests,
@@ -189,8 +190,8 @@ def _collect_commit_stats_from_commits_fallback(
     max_pages: int = BACKFILL_FALLBACK_MAX_PAGES,
 ) -> int:
     """
-    /stats/contributors 가 계속 pending일 때 /commits 기반으로 주간 커밋 수를 집계해 upsert.
-    주의: commits API만으로는 라인 증감량을 안정적으로 얻기 어려워 additions/deletions는 0으로 저장.
+    /stats/contributors 가 계속 pending일 때 /commits 기반으로 주간 집계 후 upsert.
+    각 커밋의 additions/deletions 는 /commits/{sha} 를 개별 호출해서 정확히 수집한다.
     """
     since = now - timedelta(days=lookback_days)
     commits = fetch_repo_commits(repo, since=since, max_pages=max_pages)
@@ -198,24 +199,35 @@ def _collect_commit_stats_from_commits_fallback(
         logger.info("backfill_weekly_commits fallback: no commits for %s", repo)
         return 0
 
-    weekly: dict[tuple[str, date], int] = defaultdict(int)
-    for commit in commits:
-        login = (commit.get("author") or {}).get("login", "")
-        if not login:
-            continue
+    # (login, week_start) → (additions, deletions, commits)
+    weekly: dict[tuple[str, date], list[int]] = defaultdict(lambda: [0, 0, 0])
 
-        committed_at_str = ((commit.get("commit") or {}).get("author") or {}).get("date")
-        if not committed_at_str:
-            continue
+    with httpx.Client(timeout=30) as client:
+        for commit in commits:
+            login = (commit.get("author") or {}).get("login", "")
+            if not login:
+                continue
 
-        committed_at = datetime.fromisoformat(
-            committed_at_str.rstrip("Z")
-        ).replace(tzinfo=timezone.utc)
-        week_start = _week_start_sunday(committed_at)
-        weekly[(login, week_start)] += 1
+            committed_at_str = ((commit.get("commit") or {}).get("author") or {}).get("date")
+            if not committed_at_str:
+                continue
+
+            committed_at = datetime.fromisoformat(
+                committed_at_str.rstrip("Z")
+            ).replace(tzinfo=timezone.utc)
+            week_start = _week_start_sunday(committed_at)
+            key = (login, week_start)
+
+            sha = commit.get("sha", "")
+            if sha:
+                detail = fetch_commit_detail(repo, sha, client)
+                stats = (detail or {}).get("stats") or {}
+                weekly[key][0] += stats.get("additions", 0)
+                weekly[key][1] += stats.get("deletions", 0)
+            weekly[key][2] += 1
 
     upserted = 0
-    for (login, week_start), commits_count in weekly.items():
+    for (login, week_start), (additions, deletions, commits_count) in weekly.items():
         existing = (
             db.query(DeveloperWeeklyCommits)
             .filter(
@@ -228,9 +240,8 @@ def _collect_commit_stats_from_commits_fallback(
 
         if existing:
             existing.commits = commits_count
-            # fallback 경로에서는 안전하게 line stats를 0으로 유지.
-            existing.additions = 0
-            existing.deletions = 0
+            existing.additions = additions
+            existing.deletions = deletions
             existing.collected_at = now
         else:
             db.add(
@@ -238,8 +249,8 @@ def _collect_commit_stats_from_commits_fallback(
                     repo=repo,
                     github_login=login,
                     week_start=week_start,
-                    additions=0,
-                    deletions=0,
+                    additions=additions,
+                    deletions=deletions,
                     commits=commits_count,
                     collected_at=now,
                 )

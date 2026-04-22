@@ -161,6 +161,24 @@ def fetch_repo_commits(
     return results
 
 
+def fetch_commit_detail(repo: str, sha: str, client: httpx.Client) -> dict | None:
+    """
+    GET /repos/{repo}/commits/{sha}
+    stats.additions / stats.deletions 를 포함한 커밋 상세를 반환.
+    오류 시 None 반환.
+    """
+    try:
+        response = client.get(
+            f"https://api.github.com/repos/{repo}/commits/{sha}",
+            headers=_headers(),
+        )
+        response.raise_for_status()
+        return response.json()
+    except Exception as exc:
+        logger.warning("fetch_commit_detail error for %s@%s: %s", repo, sha, exc)
+        return None
+
+
 def fetch_pull_requests(repo: str, since: datetime) -> list[dict]:
     """
     GET /repos/{repo}/pulls?state=all  (updated 순 내림차순)
