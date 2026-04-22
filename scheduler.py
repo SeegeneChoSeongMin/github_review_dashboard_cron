@@ -17,6 +17,7 @@ from github_client import (
     fetch_contributor_stats,
     fetch_contributor_stats_with_status,
     fetch_merged_pull_requests,
+    fetch_repo_commits,
     fetch_org_repos,
     fetch_pr_files,
     fetch_pull_requests,
@@ -39,6 +40,9 @@ MAX_PRS_FOR_FILE_FETCH = 100
 BACKFILL_STATS_MAX_ROUNDS = 8
 BACKFILL_STATS_INITIAL_DELAY_SECONDS = 30
 BACKFILL_STATS_MAX_DELAY_SECONDS = 300
+# stats API가 장시간 pending일 때 commits API fallback 집계 범위
+BACKFILL_FALLBACK_LOOKBACK_DAYS = 730
+BACKFILL_FALLBACK_MAX_PAGES = 100
 
 
 # ── Merged PR 파일 변경량 수집 ────────────────────────────────────────────────────
@@ -168,6 +172,87 @@ def _collect_commit_stats(repo: str, db) -> None:
 
     db.commit()
     logger.info("Commit stats upserted for %s: %d rows", repo, upserted)
+
+
+def _week_start_sunday(dt: datetime) -> date:
+    """GitHub stats 주차 기준(일요일 시작)에 맞춰 주 시작일을 계산."""
+    d = dt.date()
+    days_since_sunday = (d.weekday() + 1) % 7
+    return d - timedelta(days=days_since_sunday)
+
+
+def _collect_commit_stats_from_commits_fallback(
+    repo: str,
+    db,
+    now: datetime,
+    lookback_days: int = BACKFILL_FALLBACK_LOOKBACK_DAYS,
+    max_pages: int = BACKFILL_FALLBACK_MAX_PAGES,
+) -> int:
+    """
+    /stats/contributors 가 계속 pending일 때 /commits 기반으로 주간 커밋 수를 집계해 upsert.
+    주의: commits API만으로는 라인 증감량을 안정적으로 얻기 어려워 additions/deletions는 0으로 저장.
+    """
+    since = now - timedelta(days=lookback_days)
+    commits = fetch_repo_commits(repo, since=since, max_pages=max_pages)
+    if not commits:
+        logger.info("backfill_weekly_commits fallback: no commits for %s", repo)
+        return 0
+
+    weekly: dict[tuple[str, date], int] = defaultdict(int)
+    for commit in commits:
+        login = (commit.get("author") or {}).get("login", "")
+        if not login:
+            continue
+
+        committed_at_str = ((commit.get("commit") or {}).get("author") or {}).get("date")
+        if not committed_at_str:
+            continue
+
+        committed_at = datetime.fromisoformat(
+            committed_at_str.rstrip("Z")
+        ).replace(tzinfo=timezone.utc)
+        week_start = _week_start_sunday(committed_at)
+        weekly[(login, week_start)] += 1
+
+    upserted = 0
+    for (login, week_start), commits_count in weekly.items():
+        existing = (
+            db.query(DeveloperWeeklyCommits)
+            .filter(
+                DeveloperWeeklyCommits.repo == repo,
+                DeveloperWeeklyCommits.github_login == login,
+                DeveloperWeeklyCommits.week_start == week_start,
+            )
+            .first()
+        )
+
+        if existing:
+            existing.commits = commits_count
+            # fallback 경로에서는 안전하게 line stats를 0으로 유지.
+            existing.additions = 0
+            existing.deletions = 0
+            existing.collected_at = now
+        else:
+            db.add(
+                DeveloperWeeklyCommits(
+                    repo=repo,
+                    github_login=login,
+                    week_start=week_start,
+                    additions=0,
+                    deletions=0,
+                    commits=commits_count,
+                    collected_at=now,
+                )
+            )
+        upserted += 1
+
+    db.commit()
+    logger.info(
+        "backfill_weekly_commits fallback: %s -> %d rows from commits API",
+        repo,
+        upserted,
+    )
+    return upserted
 
 
 # ── PR/리뷰 활동 수집 ────────────────────────────────────────────────────────────
@@ -644,6 +729,8 @@ def backfill_weekly_commits() -> dict:
     total_upserted = 0
     skipped = []
     timed_out_pending = []
+    fallback_repos = []
+    fallback_failed_repos = []
     db = SessionLocal()
     try:
         now = datetime.now(timezone.utc)
@@ -747,25 +834,44 @@ def backfill_weekly_commits() -> dict:
 
         if pending_repos:
             timed_out_pending.extend(pending_repos)
-            skipped.extend(pending_repos)
             logger.warning(
                 "backfill_weekly_commits: timed out pending repos=%d",
                 len(pending_repos),
             )
+
+            # stats API가 장시간 202로 고정될 때 commits API 기반 fallback 집계 수행.
+            for repo in pending_repos:
+                try:
+                    upserted = _collect_commit_stats_from_commits_fallback(repo, db, now)
+                    total_upserted += upserted
+                    fallback_repos.append(repo)
+                except Exception as exc:
+                    logger.error(
+                        "backfill_weekly_commits fallback failed for %s: %s",
+                        repo,
+                        exc,
+                    )
+                    db.rollback()
+                    fallback_failed_repos.append(repo)
+                    skipped.append(repo)
     finally:
         db.close()
         metrics_job_lock.release()
 
     logger.info(
-        "backfill_weekly_commits done: %d total rows, %d repos skipped, %d repos pending-timeout",
+        "backfill_weekly_commits done: %d total rows, %d repos skipped, %d repos pending-timeout, %d repos fallback-ok, %d repos fallback-failed",
         total_upserted,
         len(skipped),
         len(timed_out_pending),
+        len(fallback_repos),
+        len(fallback_failed_repos),
     )
     return {
         "total_upserted": total_upserted,
         "skipped_repos": skipped,
         "timed_out_pending_repos": timed_out_pending,
+        "fallback_repos": fallback_repos,
+        "fallback_failed_repos": fallback_failed_repos,
     }
 
 

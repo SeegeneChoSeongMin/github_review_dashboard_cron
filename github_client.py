@@ -124,6 +124,43 @@ def fetch_contributor_stats_with_status(
     return CONTRIBUTOR_STATS_PENDING, []
 
 
+def fetch_repo_commits(
+    repo: str,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    max_pages: int = _MAX_PAGES,
+) -> list[dict]:
+    """
+    GET /repos/{repo}/commits
+    커밋 목록을 페이지네이션으로 수집.
+    기본 브랜치 기준으로 반환되며, 작성자 login이 없는 커밋은 호출 측에서 필터링한다.
+    """
+    params_base: dict[str, str | int] = {"per_page": 100}
+    if since:
+        params_base["since"] = since.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if until:
+        params_base["until"] = until.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    results: list[dict] = []
+    with httpx.Client(timeout=30) as client:
+        for page in range(1, max_pages + 1):
+            params = dict(params_base)
+            params["page"] = page
+            response = client.get(
+                f"https://api.github.com/repos/{repo}/commits",
+                headers=_headers(),
+                params=params,
+            )
+            response.raise_for_status()
+            page_data: list[dict] = response.json() or []
+            if not page_data:
+                break
+            results.extend(page_data)
+            if len(page_data) < 100:
+                break
+    return results
+
+
 def fetch_pull_requests(repo: str, since: datetime) -> list[dict]:
     """
     GET /repos/{repo}/pulls?state=all  (updated 순 내림차순)
