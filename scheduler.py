@@ -46,6 +46,21 @@ BACKFILL_FALLBACK_LOOKBACK_DAYS = 730
 BACKFILL_FALLBACK_MAX_PAGES = 100
 
 
+def _is_stats_stale(stats: list[dict]) -> bool:
+    """
+    GitHub /stats/contributors 가 HTTP 200을 반환했지만 라인 집계가 아직 미완성인
+    '부분 캐시' 상태를 감지한다.
+    응답 전체에서 c>0 인 주가 하나라도 있는데 a+d 合計가 0이면 stale로 판정.
+    """
+    total_commits = 0
+    total_lines = 0
+    for contributor in stats:
+        for week in contributor.get("weeks", []):
+            total_commits += week.get("c", 0)
+            total_lines += week.get("a", 0) + week.get("d", 0)
+    return total_commits > 0 and total_lines == 0
+
+
 # ── Merged PR 파일 변경량 수집 ────────────────────────────────────────────────────
 
 def _collect_merged_pr_lines(repo: str, db) -> None:
@@ -127,6 +142,13 @@ def _collect_commit_stats(repo: str, db) -> None:
         logger.warning("No contributor stats returned for %s", repo)
         return
 
+    if _is_stats_stale(stats):
+        logger.warning(
+            "Stale contributor stats for %s (commits>0 but all lines=0) — skipping to avoid overwriting valid data",
+            repo,
+        )
+        return
+
     now = datetime.now(timezone.utc)
     upserted = 0
 
@@ -153,8 +175,11 @@ def _collect_commit_stats(repo: str, db) -> None:
                 .first()
             )
             if existing:
-                existing.additions = additions
-                existing.deletions = deletions
+                # 새 데이터가 c>0 이지만 a=d=0 인 stale 주는 기존 유효값을 보호
+                stale_week = additions == 0 and deletions == 0 and commits > 0
+                if not stale_week or (existing.additions == 0 and existing.deletions == 0):
+                    existing.additions = additions
+                    existing.deletions = deletions
                 existing.commits = commits
                 existing.collected_at = now
             else:
@@ -785,6 +810,14 @@ def backfill_weekly_commits() -> dict:
                     skipped.append(repo)
                     continue
 
+                if _is_stats_stale(stats):
+                    logger.warning(
+                        "backfill_weekly_commits: stale stats for %s (commits>0 but all lines=0) — retrying",
+                        repo,
+                    )
+                    next_pending.append(repo)
+                    continue
+
                 upserted = 0
                 try:
                     for contributor in stats:
@@ -808,8 +841,10 @@ def backfill_weekly_commits() -> dict:
                                 .first()
                             )
                             if existing:
-                                existing.additions = additions
-                                existing.deletions = deletions
+                                stale_week = additions == 0 and deletions == 0 and commits > 0
+                                if not stale_week or (existing.additions == 0 and existing.deletions == 0):
+                                    existing.additions = additions
+                                    existing.deletions = deletions
                                 existing.commits = commits
                                 existing.collected_at = now
                             else:
