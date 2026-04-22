@@ -10,6 +10,11 @@ logger = logging.getLogger(__name__)
 
 _MAX_PAGES = 20  # 페이지네이션 안전 상한
 
+CONTRIBUTOR_STATS_READY = "ready"
+CONTRIBUTOR_STATS_PENDING = "pending"
+CONTRIBUTOR_STATS_EMPTY = "empty"
+CONTRIBUTOR_STATS_ERROR = "error"
+
 
 def _headers() -> dict:
     return {
@@ -52,23 +57,71 @@ def fetch_contributor_stats(repo: str) -> list[dict]:
     GitHub가 통계를 계산 중이면 202를 반환하므로 최대 3회 재시도.
     반환: [{"author": {"login": ...}, "weeks": [{"w": unix_ts, "a": adds, "d": dels, "c": commits}]}]
     """
+    status, data = fetch_contributor_stats_with_status(repo, max_attempts=3, initial_delay=5)
+    if status == CONTRIBUTOR_STATS_PENDING:
+        logger.warning("Contributor stats unavailable for %s after retries", repo)
+        return []
+    if status == CONTRIBUTOR_STATS_ERROR:
+        logger.warning("Contributor stats request failed for %s", repo)
+        return []
+    return data
+
+
+def fetch_contributor_stats_with_status(
+    repo: str,
+    max_attempts: int = 3,
+    initial_delay: int = 5,
+    max_delay: int = 60,
+) -> tuple[str, list[dict]]:
+    """
+    /stats/contributors 결과를 상태와 함께 반환.
+    반환 상태:
+      - ready: 통계 데이터 준비됨
+      - empty: 통계 없음(204 또는 빈 바디)
+      - pending: 아직 계산 중(202)
+      - error: 요청 실패 또는 응답 파싱 실패
+    """
     url = f"https://api.github.com/repos/{repo}/stats/contributors"
-    for attempt in range(3):
-        with httpx.Client(timeout=30) as client:
-            response = client.get(url, headers=_headers())
-        if response.status_code == 202:
-            logger.info("GitHub stats not ready for %s (attempt %d), retrying…", repo, attempt + 1)
-            time.sleep(5 * (attempt + 1))
-            continue
-        response.raise_for_status()
-        if not response.content:
-            return []
+    delay = max(1, initial_delay)
+
+    for attempt in range(max_attempts):
         try:
-            return response.json() or []
-        except Exception:
-            return []
-    logger.warning("Contributor stats unavailable for %s after retries", repo)
-    return []
+            with httpx.Client(timeout=30) as client:
+                response = client.get(url, headers=_headers())
+        except Exception as exc:
+            logger.warning("Contributor stats request error for %s: %s", repo, exc)
+            return CONTRIBUTOR_STATS_ERROR, []
+
+        if response.status_code == 202:
+            logger.info("GitHub stats not ready for %s (attempt %d), retrying...", repo, attempt + 1)
+            if attempt < max_attempts - 1:
+                time.sleep(delay)
+                delay = min(delay * 2, max_delay)
+            continue
+
+        if response.status_code == 204:
+            return CONTRIBUTOR_STATS_EMPTY, []
+
+        try:
+            response.raise_for_status()
+        except Exception as exc:
+            logger.warning("Contributor stats HTTP error for %s: %s", repo, exc)
+            return CONTRIBUTOR_STATS_ERROR, []
+
+        if not response.content:
+            return CONTRIBUTOR_STATS_EMPTY, []
+
+        try:
+            data = response.json() or []
+        except Exception as exc:
+            logger.warning("Contributor stats JSON parse error for %s: %s", repo, exc)
+            return CONTRIBUTOR_STATS_ERROR, []
+
+        if data:
+            return CONTRIBUTOR_STATS_READY, data
+        return CONTRIBUTOR_STATS_EMPTY, []
+
+    return CONTRIBUTOR_STATS_PENDING, []
 
 
 def fetch_pull_requests(repo: str, since: datetime) -> list[dict]:
