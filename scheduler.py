@@ -31,6 +31,16 @@ logger = logging.getLogger(__name__)
 scheduler = BackgroundScheduler()
 metrics_job_lock = threading.Lock()
 
+
+def _get_target_repos() -> list[str]:
+    """GITHUB_REPOS 설정이 있으면 해당 목록 반환, 없으면 org 전체 레포 fetch."""
+    if settings.GITHUB_REPOS.strip():
+        repos = [r.strip() for r in settings.GITHUB_REPOS.split(",") if r.strip()]
+        logger.info("Using configured repo list (%d repos)", len(repos))
+        return repos
+    return fetch_org_repos(settings.GITHUB_ORG)
+
+
 # PR/리뷰 수집 창 (시간). 겹침 여유를 1시간 두어 누락 방지.
 PR_COLLECTION_HOURS = 25
 # 리뷰 수집을 위해 per-PR 호출할 최대 PR 수 (API rate-limit 고려)
@@ -531,7 +541,7 @@ def collect_metrics() -> None:
         logger.warning("collect_metrics skipped: another metrics job is running")
         return
     try:
-        repos = fetch_org_repos(settings.GITHUB_ORG)
+        repos = _get_target_repos()
     except Exception as exc:
         logger.error("Failed to fetch org repos for %s: %s", settings.GITHUB_ORG, exc)
         metrics_job_lock.release()
@@ -583,7 +593,7 @@ def backfill_pr_data(since: datetime) -> dict:
     반환값: 처리 결과 요약 dict.
     """
     try:
-        repos = fetch_org_repos(settings.GITHUB_ORG)
+        repos = _get_target_repos()
     except Exception as exc:
         logger.error("Backfill: failed to fetch org repos: %s", exc)
         return {"error": str(exc)}
@@ -752,7 +762,7 @@ def backfill_weekly_commits() -> dict:
     엔드포인트에서 백그라운드 스레드로 호출.
     """
     try:
-        repos = fetch_org_repos(settings.GITHUB_ORG)
+        repos = _get_target_repos()
     except Exception as exc:
         logger.error("backfill_weekly_commits: failed to fetch repos: %s", exc)
         return {"error": str(exc)}
