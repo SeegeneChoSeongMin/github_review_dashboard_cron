@@ -541,48 +541,48 @@ def collect_metrics() -> None:
         logger.warning("collect_metrics skipped: another metrics job is running")
         return
     try:
-        repos = _get_target_repos()
-    except Exception as exc:
-        logger.error("Failed to fetch org repos for %s: %s", settings.GITHUB_ORG, exc)
-        metrics_job_lock.release()
-        return
-    if not repos:
-        logger.warning("No active repos found in org %s", settings.GITHUB_ORG)
-        metrics_job_lock.release()
-        return
+        try:
+            repos = _get_target_repos()
+        except Exception as exc:
+            logger.error("Failed to fetch org repos for %s: %s", settings.GITHUB_ORG, exc)
+            return
+        if not repos:
+            logger.warning("No active repos found in org %s", settings.GITHUB_ORG)
+            return
 
-    db = SessionLocal()
-    try:
-        for repo in repos:
-            logger.info("Collecting metrics for %s", repo)
-            try:
-                _collect_commit_stats(repo, db)
-            except Exception as exc:
-                logger.error("Commit stats failed for %s: %s", repo, exc)
-                db.rollback()
-            try:
-                _collect_merged_pr_lines(repo, db)
-            except Exception as exc:
-                logger.error("Merged PR lines failed for %s: %s", repo, exc)
-                db.rollback()
-            try:
-                _collect_pr_activity(repo, db)
-            except Exception as exc:
-                logger.error("PR activity failed for %s: %s", repo, exc)
-                db.rollback()
-            try:
-                _collect_pr_events(repo, db)
-            except Exception as exc:
-                logger.error("PR events failed for %s: %s", repo, exc)
-                db.rollback()
-            try:
-                since_review = datetime.now(timezone.utc) - timedelta(hours=PR_COLLECTION_HOURS)
-                _collect_review_events(repo, db, since=since_review)
-            except Exception as exc:
-                logger.error("Review events failed for %s: %s", repo, exc)
-                db.rollback()
+        db = SessionLocal()
+        try:
+            for repo in repos:
+                logger.info("Collecting metrics for %s", repo)
+                try:
+                    _collect_commit_stats(repo, db)
+                except Exception as exc:
+                    logger.error("Commit stats failed for %s: %s", repo, exc)
+                    db.rollback()
+                try:
+                    _collect_merged_pr_lines(repo, db)
+                except Exception as exc:
+                    logger.error("Merged PR lines failed for %s: %s", repo, exc)
+                    db.rollback()
+                try:
+                    _collect_pr_activity(repo, db)
+                except Exception as exc:
+                    logger.error("PR activity failed for %s: %s", repo, exc)
+                    db.rollback()
+                try:
+                    _collect_pr_events(repo, db)
+                except Exception as exc:
+                    logger.error("PR events failed for %s: %s", repo, exc)
+                    db.rollback()
+                try:
+                    since_review = datetime.now(timezone.utc) - timedelta(hours=PR_COLLECTION_HOURS)
+                    _collect_review_events(repo, db, since=since_review)
+                except Exception as exc:
+                    logger.error("Review events failed for %s: %s", repo, exc)
+                    db.rollback()
+        finally:
+            db.close()
     finally:
-        db.close()
         metrics_job_lock.release()
 
 
@@ -777,141 +777,143 @@ def backfill_weekly_commits() -> dict:
     timed_out_pending = []
     fallback_repos = []
     fallback_failed_repos = []
-    db = SessionLocal()
     try:
-        now = datetime.now(timezone.utc)
-        pending_repos = list(repos)
-        next_sleep = BACKFILL_STATS_INITIAL_DELAY_SECONDS
+        db = SessionLocal()
+        try:
+            now = datetime.now(timezone.utc)
+            pending_repos = list(repos)
+            next_sleep = BACKFILL_STATS_INITIAL_DELAY_SECONDS
 
-        for round_idx in range(1, BACKFILL_STATS_MAX_ROUNDS + 1):
-            if not pending_repos:
-                break
+            for round_idx in range(1, BACKFILL_STATS_MAX_ROUNDS + 1):
+                if not pending_repos:
+                    break
 
-            logger.info(
-                "backfill_weekly_commits: round %d/%d, pending repos=%d",
-                round_idx,
-                BACKFILL_STATS_MAX_ROUNDS,
-                len(pending_repos),
-            )
-
-            next_pending: list[str] = []
-            for repo in pending_repos:
-                status, stats = fetch_contributor_stats_with_status(
-                    repo,
-                    max_attempts=1,
-                    initial_delay=1,
-                )
-
-                if status == CONTRIBUTOR_STATS_PENDING:
-                    next_pending.append(repo)
-                    continue
-
-                if status == CONTRIBUTOR_STATS_ERROR:
-                    logger.warning("backfill_weekly_commits: stats request failed for %s", repo)
-                    skipped.append(repo)
-                    continue
-
-                if status == CONTRIBUTOR_STATS_EMPTY:
-                    logger.warning("backfill_weekly_commits: no stats for %s — skipped", repo)
-                    skipped.append(repo)
-                    continue
-
-                if status != CONTRIBUTOR_STATS_READY:
-                    skipped.append(repo)
-                    continue
-
-                if _is_stats_stale(stats):
-                    logger.warning(
-                        "backfill_weekly_commits: stale stats for %s (commits>0 but all lines=0) — retrying",
-                        repo,
-                    )
-                    next_pending.append(repo)
-                    continue
-
-                upserted = 0
-                try:
-                    for contributor in stats:
-                        login: str = (contributor.get("author") or {}).get("login", "")
-                        if not login:
-                            continue
-                        for week in contributor.get("weeks", []):
-                            additions = week.get("a", 0)
-                            deletions = week.get("d", 0)
-                            commits = week.get("c", 0)
-                            if additions == 0 and deletions == 0 and commits == 0:
-                                continue
-                            week_start = date.fromtimestamp(week["w"])
-                            existing = (
-                                db.query(DeveloperWeeklyCommits)
-                                .filter(
-                                    DeveloperWeeklyCommits.repo == repo,
-                                    DeveloperWeeklyCommits.github_login == login,
-                                    DeveloperWeeklyCommits.week_start == week_start,
-                                )
-                                .first()
-                            )
-                            if existing:
-                                stale_week = additions == 0 and deletions == 0 and commits > 0
-                                if not stale_week or (existing.additions == 0 and existing.deletions == 0):
-                                    existing.additions = additions
-                                    existing.deletions = deletions
-                                existing.commits = commits
-                                existing.collected_at = now
-                            else:
-                                db.add(
-                                    DeveloperWeeklyCommits(
-                                        repo=repo,
-                                        github_login=login,
-                                        week_start=week_start,
-                                        additions=additions,
-                                        deletions=deletions,
-                                        commits=commits,
-                                        collected_at=now,
-                                    )
-                                )
-                            upserted += 1
-                    db.commit()
-                    logger.info("backfill_weekly_commits: %s → %d rows", repo, upserted)
-                    total_upserted += upserted
-                except Exception as exc:
-                    logger.error("backfill_weekly_commits: upsert failed for %s: %s", repo, exc)
-                    db.rollback()
-                    skipped.append(repo)
-
-            pending_repos = next_pending
-            if pending_repos and round_idx < BACKFILL_STATS_MAX_ROUNDS:
                 logger.info(
-                    "backfill_weekly_commits: waiting %ds for pending repos=%d",
-                    next_sleep,
+                    "backfill_weekly_commits: round %d/%d, pending repos=%d",
+                    round_idx,
+                    BACKFILL_STATS_MAX_ROUNDS,
                     len(pending_repos),
                 )
-                time.sleep(next_sleep)
-                next_sleep = min(next_sleep * 2, BACKFILL_STATS_MAX_DELAY_SECONDS)
 
-        if pending_repos:
-            timed_out_pending.extend(pending_repos)
-            logger.warning(
-                "backfill_weekly_commits: timed out pending repos=%d",
-                len(pending_repos),
-            )
-
-            # stats API가 장시간 202로 고정될 때 commits API 기반 fallback 집계 수행.
-            for repo in pending_repos:
-                try:
-                    upserted = _collect_commit_stats_from_commits_fallback(repo, db, now)
-                    total_upserted += upserted
-                    fallback_repos.append(repo)
-                except Exception as exc:
-                    logger.error(
-                        "backfill_weekly_commits fallback failed for %s: %s",
+                next_pending: list[str] = []
+                for repo in pending_repos:
+                    status, stats = fetch_contributor_stats_with_status(
                         repo,
-                        exc,
+                        max_attempts=1,
+                        initial_delay=1,
                     )
-                    db.rollback()
-                    fallback_failed_repos.append(repo)
-                    skipped.append(repo)
+
+                    if status == CONTRIBUTOR_STATS_PENDING:
+                        next_pending.append(repo)
+                        continue
+
+                    if status == CONTRIBUTOR_STATS_ERROR:
+                        logger.warning("backfill_weekly_commits: stats request failed for %s", repo)
+                        skipped.append(repo)
+                        continue
+
+                    if status == CONTRIBUTOR_STATS_EMPTY:
+                        logger.warning("backfill_weekly_commits: no stats for %s — skipped", repo)
+                        skipped.append(repo)
+                        continue
+
+                    if status != CONTRIBUTOR_STATS_READY:
+                        skipped.append(repo)
+                        continue
+
+                    if _is_stats_stale(stats):
+                        logger.warning(
+                            "backfill_weekly_commits: stale stats for %s (commits>0 but all lines=0) — retrying",
+                            repo,
+                        )
+                        next_pending.append(repo)
+                        continue
+
+                    upserted = 0
+                    try:
+                        for contributor in stats:
+                            login: str = (contributor.get("author") or {}).get("login", "")
+                            if not login:
+                                continue
+                            for week in contributor.get("weeks", []):
+                                additions = week.get("a", 0)
+                                deletions = week.get("d", 0)
+                                commits = week.get("c", 0)
+                                if additions == 0 and deletions == 0 and commits == 0:
+                                    continue
+                                week_start = date.fromtimestamp(week["w"])
+                                existing = (
+                                    db.query(DeveloperWeeklyCommits)
+                                    .filter(
+                                        DeveloperWeeklyCommits.repo == repo,
+                                        DeveloperWeeklyCommits.github_login == login,
+                                        DeveloperWeeklyCommits.week_start == week_start,
+                                    )
+                                    .first()
+                                )
+                                if existing:
+                                    stale_week = additions == 0 and deletions == 0 and commits > 0
+                                    if not stale_week or (existing.additions == 0 and existing.deletions == 0):
+                                        existing.additions = additions
+                                        existing.deletions = deletions
+                                    existing.commits = commits
+                                    existing.collected_at = now
+                                else:
+                                    db.add(
+                                        DeveloperWeeklyCommits(
+                                            repo=repo,
+                                            github_login=login,
+                                            week_start=week_start,
+                                            additions=additions,
+                                            deletions=deletions,
+                                            commits=commits,
+                                            collected_at=now,
+                                        )
+                                    )
+                                upserted += 1
+                        db.commit()
+                        logger.info("backfill_weekly_commits: %s → %d rows", repo, upserted)
+                        total_upserted += upserted
+                    except Exception as exc:
+                        logger.error("backfill_weekly_commits: upsert failed for %s: %s", repo, exc)
+                        db.rollback()
+                        skipped.append(repo)
+
+                pending_repos = next_pending
+                if pending_repos and round_idx < BACKFILL_STATS_MAX_ROUNDS:
+                    logger.info(
+                        "backfill_weekly_commits: waiting %ds for pending repos=%d",
+                        next_sleep,
+                        len(pending_repos),
+                    )
+                    time.sleep(next_sleep)
+                    next_sleep = min(next_sleep * 2, BACKFILL_STATS_MAX_DELAY_SECONDS)
+
+            if pending_repos:
+                timed_out_pending.extend(pending_repos)
+                logger.warning(
+                    "backfill_weekly_commits: timed out pending repos=%d",
+                    len(pending_repos),
+                )
+
+                # stats API가 장시간 202로 고정될 때 commits API 기반 fallback 집계 수행.
+                for repo in pending_repos:
+                    try:
+                        upserted = _collect_commit_stats_from_commits_fallback(repo, db, now)
+                        total_upserted += upserted
+                        fallback_repos.append(repo)
+                    except Exception as exc:
+                        logger.error(
+                            "backfill_weekly_commits fallback failed for %s: %s",
+                            repo,
+                            exc,
+                        )
+                        db.rollback()
+                        fallback_failed_repos.append(repo)
+                        skipped.append(repo)
+        finally:
+            db.close()
     finally:
-        db.close()
         metrics_job_lock.release()
 
     logger.info(
