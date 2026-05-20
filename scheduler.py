@@ -586,6 +586,131 @@ def collect_metrics() -> None:
         metrics_job_lock.release()
 
 
+def _backfill_merged_pr_lines(repo: str, since: datetime, db) -> int:
+    """since 이후 머지된 PR의 파일 변경량을 수집해 upsert. 저장된 행 수를 반환."""
+    prs = fetch_merged_pull_requests(repo, since=since)
+    now = datetime.now(timezone.utc)
+    upserted = 0
+    with httpx.Client(timeout=20) as client:
+        for pr in prs:
+            login: str = (pr.get("user") or {}).get("login", "")
+            if not login:
+                continue
+            pr_number: int = pr["number"]
+            base_branch: str = (pr.get("base") or {}).get("ref", "")
+            merged_at = datetime.fromisoformat(
+                pr["merged_at"].rstrip("Z")
+            ).replace(tzinfo=timezone.utc)
+            try:
+                files = fetch_pr_files(repo, pr_number, client)
+            except Exception as exc:
+                logger.warning("Backfill: files failed PR #%d: %s", pr_number, exc)
+                continue
+            total_adds = sum(f.get("additions", 0) for f in files)
+            total_dels = sum(f.get("deletions", 0) for f in files)
+            existing = (
+                db.query(DeveloperMergedPRLines)
+                .filter(
+                    DeveloperMergedPRLines.repo == repo,
+                    DeveloperMergedPRLines.pr_number == pr_number,
+                )
+                .first()
+            )
+            if existing:
+                existing.additions = total_adds
+                existing.deletions = total_dels
+                existing.collected_at = now
+            else:
+                db.add(
+                    DeveloperMergedPRLines(
+                        repo=repo,
+                        pr_number=pr_number,
+                        github_login=login,
+                        base_branch=base_branch,
+                        additions=total_adds,
+                        deletions=total_dels,
+                        merged_at=merged_at,
+                        collected_at=now,
+                    )
+                )
+            upserted += 1
+    db.commit()
+    logger.info("Backfill PR lines for %s: %d rows", repo, upserted)
+    return upserted
+
+
+def _backfill_pr_activity(repo: str, since: datetime, db) -> int:
+    """since 이후의 PR/리뷰 활동을 집계해 DeveloperPRActivity 에 upsert. 처리된 개발자 수를 반환."""
+    prs_all = fetch_pull_requests(repo, since=since)
+    review_comments = fetch_review_comments(repo, since=since)
+
+    prs_opened: dict[str, int] = defaultdict(int)
+    prs_merged: dict[str, int] = defaultdict(int)
+    reviews_given: dict[str, int] = defaultdict(int)
+    review_comments_given: dict[str, int] = defaultdict(int)
+
+    for pr in prs_all:
+        login = (pr.get("user") or {}).get("login", "")
+        if not login:
+            continue
+        created_at = datetime.fromisoformat(
+            pr["created_at"].rstrip("Z")
+        ).replace(tzinfo=timezone.utc)
+        if created_at >= since:
+            prs_opened[login] += 1
+        merged_at_str = pr.get("merged_at")
+        if merged_at_str:
+            merged_at = datetime.fromisoformat(
+                merged_at_str.rstrip("Z")
+            ).replace(tzinfo=timezone.utc)
+            if merged_at >= since:
+                prs_merged[login] += 1
+
+    for comment in review_comments:
+        login = (comment.get("user") or {}).get("login", "")
+        if login:
+            review_comments_given[login] += 1
+
+    pr_numbers = [pr["number"] for pr in prs_all[:MAX_PRS_FOR_REVIEW_FETCH]]
+    with httpx.Client(timeout=15) as client:
+        for pr_number in pr_numbers:
+            try:
+                for review in fetch_reviews_for_pr(repo, pr_number, client):
+                    login = (review.get("user") or {}).get("login", "")
+                    submitted_at_str = review.get("submitted_at")
+                    if not login or not submitted_at_str:
+                        continue
+                    submitted_at = datetime.fromisoformat(
+                        submitted_at_str.rstrip("Z")
+                    ).replace(tzinfo=timezone.utc)
+                    if submitted_at >= since:
+                        reviews_given[login] += 1
+            except Exception as exc:
+                logger.warning("Backfill: reviews failed PR #%d: %s", pr_number, exc)
+
+    period_end = datetime.now(timezone.utc)
+    all_logins = (
+        set(prs_opened) | set(prs_merged)
+        | set(reviews_given) | set(review_comments_given)
+    )
+    for login in all_logins:
+        db.add(
+            DeveloperPRActivity(
+                repo=repo,
+                github_login=login,
+                period_start=since,
+                period_end=period_end,
+                prs_opened=prs_opened.get(login, 0),
+                prs_merged=prs_merged.get(login, 0),
+                reviews_given=reviews_given.get(login, 0),
+                review_comments_given=review_comments_given.get(login, 0),
+            )
+        )
+    db.commit()
+    logger.info("Backfill PR activity for %s: %d developers", repo, len(all_logins))
+    return len(all_logins)
+
+
 def backfill_pr_data(since: datetime) -> dict:
     """
     since 이후의 PR 라인 변경량 + PR/리뷰 활동을 모든 org repo에 대해 소급 수집.
@@ -605,132 +730,15 @@ def backfill_pr_data(since: datetime) -> dict:
             repo_result: dict = {"pr_lines": 0, "pr_activity_devs": 0, "error": None}
             logger.info("Backfill started for %s since %s", repo, since.isoformat())
 
-            # ── Merged PR 파일 변경량 ──────────────────────────────────────────
             try:
-                prs = fetch_merged_pull_requests(repo, since=since)
-                now = datetime.now(timezone.utc)
-                upserted = 0
-                with httpx.Client(timeout=20) as client:
-                    for pr in prs:  # 백필은 상한 없이 전체 처리
-                        login: str = (pr.get("user") or {}).get("login", "")
-                        if not login:
-                            continue
-                        pr_number: int = pr["number"]
-                        base_branch: str = (pr.get("base") or {}).get("ref", "")
-                        merged_at = datetime.fromisoformat(
-                            pr["merged_at"].rstrip("Z")
-                        ).replace(tzinfo=timezone.utc)
-                        try:
-                            files = fetch_pr_files(repo, pr_number, client)
-                        except Exception as exc:
-                            logger.warning("Backfill: files failed PR #%d: %s", pr_number, exc)
-                            continue
-                        total_adds = sum(f.get("additions", 0) for f in files)
-                        total_dels = sum(f.get("deletions", 0) for f in files)
-                        existing = (
-                            db.query(DeveloperMergedPRLines)
-                            .filter(
-                                DeveloperMergedPRLines.repo == repo,
-                                DeveloperMergedPRLines.pr_number == pr_number,
-                            )
-                            .first()
-                        )
-                        if existing:
-                            existing.additions = total_adds
-                            existing.deletions = total_dels
-                            existing.collected_at = now
-                        else:
-                            db.add(
-                                DeveloperMergedPRLines(
-                                    repo=repo,
-                                    pr_number=pr_number,
-                                    github_login=login,
-                                    base_branch=base_branch,
-                                    additions=total_adds,
-                                    deletions=total_dels,
-                                    merged_at=merged_at,
-                                    collected_at=now,
-                                )
-                            )
-                        upserted += 1
-                db.commit()
-                repo_result["pr_lines"] = upserted
-                logger.info("Backfill PR lines for %s: %d rows", repo, upserted)
+                repo_result["pr_lines"] = _backfill_merged_pr_lines(repo, since, db)
             except Exception as exc:
                 logger.error("Backfill PR lines failed for %s: %s", repo, exc)
                 db.rollback()
                 repo_result["error"] = str(exc)
 
-            # ── PR/리뷰 활동 ───────────────────────────────────────────────────
             try:
-                prs_all = fetch_pull_requests(repo, since=since)
-                review_comments = fetch_review_comments(repo, since=since)
-
-                prs_opened: dict[str, int] = defaultdict(int)
-                prs_merged: dict[str, int] = defaultdict(int)
-                reviews_given: dict[str, int] = defaultdict(int)
-                review_comments_given: dict[str, int] = defaultdict(int)
-
-                for pr in prs_all:
-                    login = (pr.get("user") or {}).get("login", "")
-                    if not login:
-                        continue
-                    created_at = datetime.fromisoformat(
-                        pr["created_at"].rstrip("Z")
-                    ).replace(tzinfo=timezone.utc)
-                    if created_at >= since:
-                        prs_opened[login] += 1
-                    merged_at_str = pr.get("merged_at")
-                    if merged_at_str:
-                        merged_at = datetime.fromisoformat(
-                            merged_at_str.rstrip("Z")
-                        ).replace(tzinfo=timezone.utc)
-                        if merged_at >= since:
-                            prs_merged[login] += 1
-
-                for comment in review_comments:
-                    login = (comment.get("user") or {}).get("login", "")
-                    if login:
-                        review_comments_given[login] += 1
-
-                pr_numbers = [pr["number"] for pr in prs_all[:MAX_PRS_FOR_REVIEW_FETCH]]
-                with httpx.Client(timeout=15) as client:
-                    for pr_number in pr_numbers:
-                        try:
-                            for review in fetch_reviews_for_pr(repo, pr_number, client):
-                                login = (review.get("user") or {}).get("login", "")
-                                submitted_at_str = review.get("submitted_at")
-                                if not login or not submitted_at_str:
-                                    continue
-                                submitted_at = datetime.fromisoformat(
-                                    submitted_at_str.rstrip("Z")
-                                ).replace(tzinfo=timezone.utc)
-                                if submitted_at >= since:
-                                    reviews_given[login] += 1
-                        except Exception as exc:
-                            logger.warning("Backfill: reviews failed PR #%d: %s", pr_number, exc)
-
-                period_end = datetime.now(timezone.utc)
-                all_logins = (
-                    set(prs_opened) | set(prs_merged)
-                    | set(reviews_given) | set(review_comments_given)
-                )
-                for login in all_logins:
-                    db.add(
-                        DeveloperPRActivity(
-                            repo=repo,
-                            github_login=login,
-                            period_start=since,
-                            period_end=period_end,
-                            prs_opened=prs_opened.get(login, 0),
-                            prs_merged=prs_merged.get(login, 0),
-                            reviews_given=reviews_given.get(login, 0),
-                            review_comments_given=review_comments_given.get(login, 0),
-                        )
-                    )
-                db.commit()
-                repo_result["pr_activity_devs"] = len(all_logins)
-                logger.info("Backfill PR activity for %s: %d developers", repo, len(all_logins))
+                repo_result["pr_activity_devs"] = _backfill_pr_activity(repo, since, db)
             except Exception as exc:
                 logger.error("Backfill PR activity failed for %s: %s", repo, exc)
                 db.rollback()
@@ -739,7 +747,6 @@ def backfill_pr_data(since: datetime) -> dict:
                 else:
                     repo_result["error"] = str(exc)
 
-            # ── 리뷰 이벤트 ─────────────────────────────────────────────────────
             try:
                 _collect_review_events(repo, db, since=since)
                 repo_result["review_events"] = True
@@ -753,6 +760,52 @@ def backfill_pr_data(since: datetime) -> dict:
 
     logger.info("Backfill complete: %s", summary)
     return summary
+
+
+def _upsert_contributor_stats(repo: str, stats: list, db, now: datetime) -> int:
+    """stats/contributors 응답을 DeveloperWeeklyCommits 테이블에 upsert. 저장된 행 수를 반환."""
+    upserted = 0
+    for contributor in stats:
+        login: str = (contributor.get("author") or {}).get("login", "")
+        if not login:
+            continue
+        for week in contributor.get("weeks", []):
+            additions = week.get("a", 0)
+            deletions = week.get("d", 0)
+            commits = week.get("c", 0)
+            if additions == 0 and deletions == 0 and commits == 0:
+                continue
+            week_start = date.fromtimestamp(week["w"])
+            existing = (
+                db.query(DeveloperWeeklyCommits)
+                .filter(
+                    DeveloperWeeklyCommits.repo == repo,
+                    DeveloperWeeklyCommits.github_login == login,
+                    DeveloperWeeklyCommits.week_start == week_start,
+                )
+                .first()
+            )
+            if existing:
+                stale_week = additions == 0 and deletions == 0 and commits > 0
+                if not stale_week or (existing.additions == 0 and existing.deletions == 0):
+                    existing.additions = additions
+                    existing.deletions = deletions
+                existing.commits = commits
+                existing.collected_at = now
+            else:
+                db.add(
+                    DeveloperWeeklyCommits(
+                        repo=repo,
+                        github_login=login,
+                        week_start=week_start,
+                        additions=additions,
+                        deletions=deletions,
+                        commits=commits,
+                        collected_at=now,
+                    )
+                )
+            upserted += 1
+    return upserted
 
 
 def backfill_weekly_commits() -> dict:
@@ -829,48 +882,8 @@ def backfill_weekly_commits() -> dict:
                         next_pending.append(repo)
                         continue
 
-                    upserted = 0
                     try:
-                        for contributor in stats:
-                            login: str = (contributor.get("author") or {}).get("login", "")
-                            if not login:
-                                continue
-                            for week in contributor.get("weeks", []):
-                                additions = week.get("a", 0)
-                                deletions = week.get("d", 0)
-                                commits = week.get("c", 0)
-                                if additions == 0 and deletions == 0 and commits == 0:
-                                    continue
-                                week_start = date.fromtimestamp(week["w"])
-                                existing = (
-                                    db.query(DeveloperWeeklyCommits)
-                                    .filter(
-                                        DeveloperWeeklyCommits.repo == repo,
-                                        DeveloperWeeklyCommits.github_login == login,
-                                        DeveloperWeeklyCommits.week_start == week_start,
-                                    )
-                                    .first()
-                                )
-                                if existing:
-                                    stale_week = additions == 0 and deletions == 0 and commits > 0
-                                    if not stale_week or (existing.additions == 0 and existing.deletions == 0):
-                                        existing.additions = additions
-                                        existing.deletions = deletions
-                                    existing.commits = commits
-                                    existing.collected_at = now
-                                else:
-                                    db.add(
-                                        DeveloperWeeklyCommits(
-                                            repo=repo,
-                                            github_login=login,
-                                            week_start=week_start,
-                                            additions=additions,
-                                            deletions=deletions,
-                                            commits=commits,
-                                            collected_at=now,
-                                        )
-                                    )
-                                upserted += 1
+                        upserted = _upsert_contributor_stats(repo, stats, db, now)
                         db.commit()
                         logger.info("backfill_weekly_commits: %s → %d rows", repo, upserted)
                         total_upserted += upserted
